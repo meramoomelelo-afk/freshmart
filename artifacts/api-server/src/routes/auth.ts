@@ -83,7 +83,7 @@ const authRateLimiter = rateLimit({
   message: { error: "Too Many Requests", message: "Too many OTP requests. Please try again in 15 minutes." },
   standardHeaders: true,
   legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
+  validate: { xForwardedForHeader: false, keyGeneratorIpFallback: false },
   keyGenerator: (req: Request) => {
     const phone = req.body?.phone;
     if (typeof phone === "string") return phone.replace(/\D/g, "").slice(-10);
