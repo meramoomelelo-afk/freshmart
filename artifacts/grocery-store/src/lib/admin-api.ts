@@ -2,12 +2,18 @@ import { apiRequest as request } from "./api-client";
 
 export const adminApi = {
   checkSetup: () => request("/admin/check-setup"),
-  setup: (data: { username: string; password: string; displayName: string }) =>
+  setup: (data: { username: string; password: string; displayName: string; email: string }) =>
     request("/admin/setup", { method: "POST", body: JSON.stringify(data) }),
   login: (data: { username: string; password: string }) =>
     request("/admin/login", { method: "POST", body: JSON.stringify(data) }),
   logout: () => request("/admin/logout", { method: "POST" }),
   me: () => request("/admin/me"),
+  forgotPassword: (email: string) =>
+    request("/admin/forgot-password", { method: "POST", body: JSON.stringify({ email }) }),
+  resetPassword: (token: string, password: string) =>
+    request("/admin/reset-password", { method: "POST", body: JSON.stringify({ token, password }) }),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    request("/admin/change-password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) }),
 
   getDashboard: () => request("/admin/dashboard"),
 
