@@ -3,7 +3,7 @@ import { db, adminUsersTable, productsTable, categoriesTable, ordersTable, siteS
 import { eq, desc, ilike, count, sql, inArray, notInArray } from "drizzle-orm";
 import { PRODUCE_DATA } from "../produce-data";
 import bcrypt from "bcryptjs";
-import { randomUUID } from "crypto";
+import { randomUUID, createHash, randomBytes, timingSafeEqual } from "crypto";
 import { getAllBBProducts, getBBProductsForCategory, BB_CATEGORIES, type BBCategory, type BBProduct } from "../bigbasket-data";
 import { getNotifications, addNotification, getSmsStatus } from "./auth";
 import { getWhatsAppState, startWhatsAppSession, disconnectWhatsApp, sendWhatsAppMessage, sendWhatsAppDocument, isWhatsAppConnected } from "../whatsapp-service";
@@ -17,11 +17,42 @@ const router: IRouter = Router();
 
 const adminLoginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 50,
-  message: { error: "Too Many Requests", message: "Too many login attempts. Please try again later." },
+  max: 10,
+  message: { error: "Too Many Requests", message: "Too many login attempts. Please wait 15 minutes." },
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
 });
+
+const adminStrictLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 5,
+  message: { error: "Too Many Requests", message: "Too many failed attempts. Please wait 5 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+const DUMMY_HASH = "$2b$12$invalidhashfortimingprotectionXXXXXXXXXXXXXXXXXXXXXX";
+
+const PASSWORD_MIN_LENGTH = 8;
+
+function validatePasswordStrength(pw: string): string | null {
+  if (pw.length < PASSWORD_MIN_LENGTH) return `Password must be at least ${PASSWORD_MIN_LENGTH} characters.`;
+  if (!/[0-9]/.test(pw) && !/[^a-zA-Z0-9]/.test(pw)) return "Password must contain at least one number or special character.";
+  return null;
+}
+
+function hashResetToken(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function cleanExpiredSessions() {
+  const now = Date.now();
+  for (const [key, val] of sessions) {
+    if (now > val.expiresAt) sessions.delete(key);
+  }
+}
 
 async function sendProductAlert(type: "new" | "price_drop" | "back_in_stock" | "discount", productName: string, price: number, originalPrice?: number, discount?: number) {
   if (!isWhatsAppConnected()) return;
@@ -62,117 +93,315 @@ async function sendProductAlert(type: "new" | "price_drop" | "back_in_stock" | "
   }
 }
 
-const sessions = new Map<string, { userId: number; username: string; displayName: string; expiresAt: number }>();
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_FAILED_ATTEMPTS = 5;
+const LOCKOUT_DURATION_MS = 30 * 60 * 1000;
+const BCRYPT_ROUNDS = 12;
+
+const sessions = new Map<string, { userId: number; username: string; displayName: string; email: string | null; expiresAt: number }>();
+
+function setAdminCookie(res: Response, token: string) {
+  res.cookie("admin_token", token, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: SESSION_TTL_MS,
+    path: "/",
+  });
+}
 
 function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   const token = req.cookies?.admin_token;
-  if (!token || !sessions.has(token)) {
+  if (!token || typeof token !== "string" || !sessions.has(token)) {
     res.status(401).json({ error: "Unauthorized", message: "Admin login required" });
     return;
   }
   const session = sessions.get(token)!;
   if (Date.now() > session.expiresAt) {
     sessions.delete(token);
-    res.status(401).json({ error: "Unauthorized", message: "Session expired" });
+    res.status(401).json({ error: "Unauthorized", message: "Session expired. Please log in again." });
     return;
   }
   (req as any).admin = session;
   next();
 }
 
-router.post("/admin/login", adminLoginLimiter, async (req: Request, res: Response): Promise<void> => {
-  const { username, password } = req.body as { username: string; password: string };
+router.post("/admin/login", adminLoginLimiter, adminStrictLimiter, async (req: Request, res: Response): Promise<void> => {
+  const username = typeof req.body?.username === "string" ? req.body.username.trim().slice(0, 100) : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
 
   if (!username || !password) {
     res.status(400).json({ error: "Bad Request", message: "Username and password are required" });
     return;
   }
 
+  cleanExpiredSessions();
+
   const [user] = await db.select().from(adminUsersTable).where(eq(adminUsersTable.username, username));
 
   if (!user) {
+    await bcrypt.compare("dummy_timing_protection", DUMMY_HASH).catch(() => {});
     res.status(401).json({ error: "Unauthorized", message: "Invalid credentials" });
+    return;
+  }
+
+  if (user.lockedUntil && new Date(user.lockedUntil) > new Date()) {
+    const minutesLeft = Math.ceil((new Date(user.lockedUntil).getTime() - Date.now()) / 60000);
+    res.status(403).json({ error: "Forbidden", message: `Account locked due to too many failed attempts. Try again in ${minutesLeft} minute(s).` });
     return;
   }
 
   const valid = await bcrypt.compare(password, user.passwordHash);
+
   if (!valid) {
-    res.status(401).json({ error: "Unauthorized", message: "Invalid credentials" });
+    const newAttempts = (user.failedLoginAttempts ?? 0) + 1;
+    const shouldLock = newAttempts >= MAX_FAILED_ATTEMPTS;
+    await db.update(adminUsersTable).set({
+      failedLoginAttempts: newAttempts,
+      lockedUntil: shouldLock ? new Date(Date.now() + LOCKOUT_DURATION_MS) : null,
+      updatedAt: new Date(),
+    }).where(eq(adminUsersTable.id, user.id));
+
+    const remaining = MAX_FAILED_ATTEMPTS - newAttempts;
+    const msg = shouldLock
+      ? `Account locked for 30 minutes due to too many failed attempts.`
+      : `Invalid credentials. ${remaining > 0 ? `${remaining} attempt(s) remaining before lockout.` : ""}`;
+    res.status(401).json({ error: "Unauthorized", message: msg });
     return;
   }
+
+  await db.update(adminUsersTable).set({
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    updatedAt: new Date(),
+  }).where(eq(adminUsersTable.id, user.id));
 
   const token = randomUUID();
   sessions.set(token, {
     userId: user.id,
     username: user.username,
     displayName: user.displayName,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    email: user.email ?? null,
+    expiresAt: Date.now() + SESSION_TTL_MS,
   });
 
-  res.cookie("admin_token", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 24 * 60 * 60 * 1000,
-    path: "/",
-  });
-
+  setAdminCookie(res, token);
   res.json({ success: true, user: { id: user.id, username: user.username, displayName: user.displayName } });
 });
 
-router.post("/admin/logout", (_req: Request, res: Response): void => {
-  const token = _req.cookies?.admin_token;
-  if (token) sessions.delete(token);
+router.post("/admin/logout", (req: Request, res: Response): void => {
+  const token = req.cookies?.admin_token;
+  if (token && typeof token === "string") sessions.delete(token);
   res.clearCookie("admin_token", { path: "/" });
   res.json({ success: true });
 });
 
 router.get("/admin/me", requireAdmin, (req: Request, res: Response): void => {
   const admin = (req as any).admin;
-  res.json({ user: { id: admin.userId, username: admin.username, displayName: admin.displayName } });
+  res.json({ user: { id: admin.userId, username: admin.username, displayName: admin.displayName, email: admin.email } });
 });
 
-router.post("/admin/setup", async (req: Request, res: Response): Promise<void> => {
-  const existing = await db.select().from(adminUsersTable);
-  if (existing.length > 0) {
-    res.status(400).json({ error: "Bad Request", message: "Admin already exists" });
-    return;
-  }
+const adminSetupLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 3,
+  message: { error: "Too Many Requests", message: "Too many setup attempts. Try again in an hour." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
 
+router.post("/admin/setup", adminSetupLimiter, async (req: Request, res: Response): Promise<void> => {
   const b = req.body ?? {};
   const username = typeof b.username === "string" ? b.username.trim().slice(0, 50) : "";
   const password = typeof b.password === "string" ? b.password : "";
   const displayName = typeof b.displayName === "string" ? b.displayName.trim().slice(0, 100) : "";
-  if (!username || !password || !displayName) {
-    res.status(400).json({ error: "Bad Request", message: "All fields required" });
+  const email = typeof b.email === "string" ? b.email.trim().toLowerCase().slice(0, 200) : "";
+
+  if (!username || !password || !displayName || !email) {
+    res.status(400).json({ error: "Bad Request", message: "All fields required (username, email, password, displayName)" });
     return;
   }
 
-  const passwordHash = await bcrypt.hash(password, 10);
-  const [user] = await db.insert(adminUsersTable).values({ username, passwordHash, displayName }).returning();
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(email)) {
+    res.status(400).json({ error: "Bad Request", message: "Invalid email address" });
+    return;
+  }
+
+  const pwError = validatePasswordStrength(password);
+  if (pwError) {
+    res.status(400).json({ error: "Bad Request", message: pwError });
+    return;
+  }
+
+  if (!/^[a-zA-Z0-9_.-]{3,50}$/.test(username)) {
+    res.status(400).json({ error: "Bad Request", message: "Username must be 3–50 characters (letters, numbers, _ . - only)" });
+    return;
+  }
+
+  const existing = await db.select({ id: adminUsersTable.id }).from(adminUsersTable).limit(1);
+  if (existing.length > 0) {
+    res.status(400).json({ error: "Bad Request", message: "Admin account already exists. Use login instead." });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
+  let user: { id: number; username: string; displayName: string; email: string | null };
+  try {
+    const [created] = await db.insert(adminUsersTable).values({ username, email, passwordHash, displayName }).returning();
+    user = created;
+  } catch (err: any) {
+    if (err?.code === "23505") {
+      res.status(400).json({ error: "Bad Request", message: "Username or email already taken." });
+      return;
+    }
+    throw err;
+  }
 
   const token = randomUUID();
   sessions.set(token, {
     userId: user.id,
     username: user.username,
     displayName: user.displayName,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    email: user.email ?? null,
+    expiresAt: Date.now() + SESSION_TTL_MS,
   });
 
-  res.cookie("admin_token", token, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: 24 * 60 * 60 * 1000,
-    path: "/",
-  });
-
+  setAdminCookie(res, token);
   res.json({ success: true, user: { id: user.id, username: user.username, displayName: user.displayName } });
 });
 
 router.get("/admin/check-setup", async (_req: Request, res: Response): Promise<void> => {
-  const existing = await db.select().from(adminUsersTable);
+  const existing = await db.select({ id: adminUsersTable.id }).from(adminUsersTable).limit(1);
   res.json({ needsSetup: existing.length === 0 });
+});
+
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 3,
+  message: { error: "Too Many Requests", message: "Too many reset requests. Try again in 15 minutes." },
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+router.post("/admin/forgot-password", forgotPasswordLimiter, async (req: Request, res: Response): Promise<void> => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim().toLowerCase().slice(0, 200) : "";
+
+  if (!email) {
+    res.status(400).json({ error: "Bad Request", message: "Email is required" });
+    return;
+  }
+
+  const [admin] = await db.select().from(adminUsersTable).where(eq(adminUsersTable.email, email));
+
+  const GENERIC_OK = { success: true, message: "If that email is registered, a reset token has been generated. Check your server logs." };
+
+  if (!admin) {
+    await new Promise(r => setTimeout(r, 200 + Math.random() * 200));
+    res.json(GENERIC_OK);
+    return;
+  }
+
+  const resetToken = randomBytes(32).toString("hex");
+  const tokenHash = hashResetToken(resetToken);
+  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+
+  await db.update(adminUsersTable).set({
+    passwordResetToken: tokenHash,
+    passwordResetExpiresAt: expiresAt,
+    updatedAt: new Date(),
+  }).where(eq(adminUsersTable.id, admin.id));
+
+  console.log(`\n[ADMIN SECURITY] Password reset requested for: ${admin.username}`);
+  console.log(`[ADMIN SECURITY] Reset token (valid 1 hour): ${resetToken}`);
+  console.log(`[ADMIN SECURITY] Use this token on the /admin/login reset page.\n`);
+
+  res.json({ ...GENERIC_OK, devToken: process.env.NODE_ENV !== "production" ? resetToken : undefined });
+});
+
+router.post("/admin/reset-password", forgotPasswordLimiter, async (req: Request, res: Response): Promise<void> => {
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+  if (!token || !password) {
+    res.status(400).json({ error: "Bad Request", message: "Token and new password are required" });
+    return;
+  }
+
+  const pwError = validatePasswordStrength(password);
+  if (pwError) {
+    res.status(400).json({ error: "Bad Request", message: pwError });
+    return;
+  }
+
+  const tokenHash = hashResetToken(token);
+
+  const [admin] = await db.select().from(adminUsersTable).where(eq(adminUsersTable.passwordResetToken, tokenHash));
+
+  if (!admin || !admin.passwordResetExpiresAt || new Date(admin.passwordResetExpiresAt) < new Date()) {
+    res.status(400).json({ error: "Bad Request", message: "Invalid or expired reset token." });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(password, BCRYPT_ROUNDS);
+
+  await db.update(adminUsersTable).set({
+    passwordHash,
+    passwordResetToken: null,
+    passwordResetExpiresAt: null,
+    failedLoginAttempts: 0,
+    lockedUntil: null,
+    updatedAt: new Date(),
+  }).where(eq(adminUsersTable.id, admin.id));
+
+  for (const [key, val] of sessions) {
+    if (val.userId === admin.id) sessions.delete(key);
+  }
+
+  console.log(`[ADMIN SECURITY] Password successfully reset for user: ${admin.username}`);
+
+  res.json({ success: true, message: "Password has been reset. Please log in with your new password." });
+});
+
+router.post("/admin/change-password", requireAdmin, async (req: Request, res: Response): Promise<void> => {
+  const currentPassword = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
+  const newPassword = typeof req.body?.newPassword === "string" ? req.body.newPassword : "";
+  const adminSession = (req as any).admin;
+
+  if (!currentPassword || !newPassword) {
+    res.status(400).json({ error: "Bad Request", message: "Current and new password are required" });
+    return;
+  }
+
+  const pwError = validatePasswordStrength(newPassword);
+  if (pwError) {
+    res.status(400).json({ error: "Bad Request", message: pwError });
+    return;
+  }
+
+  const [admin] = await db.select().from(adminUsersTable).where(eq(adminUsersTable.id, adminSession.userId));
+  if (!admin) {
+    res.status(404).json({ error: "Not Found", message: "Admin not found" });
+    return;
+  }
+
+  const valid = await bcrypt.compare(currentPassword, admin.passwordHash);
+  if (!valid) {
+    res.status(401).json({ error: "Unauthorized", message: "Current password is incorrect" });
+    return;
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+  await db.update(adminUsersTable).set({ passwordHash, updatedAt: new Date() }).where(eq(adminUsersTable.id, admin.id));
+
+  const currentToken = req.cookies?.admin_token;
+  for (const [key, val] of sessions) {
+    if (val.userId === admin.id && key !== currentToken) sessions.delete(key);
+  }
+
+  res.json({ success: true, message: "Password changed successfully." });
 });
 
 router.get("/admin/dashboard", requireAdmin, async (_req: Request, res: Response): Promise<void> => {
