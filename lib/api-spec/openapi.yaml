@@ -1,0 +1,488 @@
+openapi: 3.1.0
+info:
+  title: Api
+  version: 0.1.0
+  description: FreshMart Grocery Store API
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: products
+    description: Product operations
+  - name: categories
+    description: Category operations
+  - name: cart
+    description: Cart operations
+  - name: orders
+    description: Order operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+
+  /categories:
+    get:
+      operationId: getCategories
+      tags: [categories]
+      summary: Get all categories
+      responses:
+        "200":
+          description: List of categories
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Category"
+
+  /products:
+    get:
+      operationId: getProducts
+      tags: [products]
+      summary: Get all products
+      parameters:
+        - in: query
+          name: categoryId
+          schema:
+            type: string
+          required: false
+        - in: query
+          name: search
+          schema:
+            type: string
+          required: false
+        - in: query
+          name: featured
+          schema:
+            type: boolean
+          required: false
+        - in: query
+          name: limit
+          schema:
+            type: number
+          required: false
+      responses:
+        "200":
+          description: List of products
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Product"
+
+  /products/{id}:
+    get:
+      operationId: getProduct
+      tags: [products]
+      summary: Get product by id
+      parameters:
+        - in: path
+          name: id
+          schema:
+            type: string
+          required: true
+      responses:
+        "200":
+          description: Product details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Product"
+        "404":
+          description: Product not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /products/summary:
+    get:
+      operationId: getProductSummary
+      tags: [products]
+      summary: Get product summary statistics
+      responses:
+        "200":
+          description: Summary stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProductSummary"
+
+  /cart:
+    get:
+      operationId: getCart
+      tags: [cart]
+      summary: Get cart items
+      responses:
+        "200":
+          description: Cart items
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+    post:
+      operationId: addToCart
+      tags: [cart]
+      summary: Add item to cart
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AddToCartRequest"
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+    delete:
+      operationId: clearCart
+      tags: [cart]
+      summary: Clear the cart
+      responses:
+        "200":
+          description: Cleared cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+
+  /cart/{productId}:
+    put:
+      operationId: updateCartItem
+      tags: [cart]
+      summary: Update cart item quantity
+      parameters:
+        - in: path
+          name: productId
+          schema:
+            type: string
+          required: true
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateCartItemRequest"
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+    delete:
+      operationId: removeFromCart
+      tags: [cart]
+      summary: Remove item from cart
+      parameters:
+        - in: path
+          name: productId
+          schema:
+            type: string
+          required: true
+      responses:
+        "200":
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Cart"
+
+  /orders:
+    post:
+      operationId: placeOrder
+      tags: [orders]
+      summary: Place an order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlaceOrderRequest"
+      responses:
+        "201":
+          description: Order placed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+
+  /deals:
+    get:
+      operationId: getDeals
+      tags: [products]
+      summary: Get today's deals and featured offers
+      responses:
+        "200":
+          description: List of deals
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Product"
+
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        message:
+          type: string
+      required:
+        - error
+        - message
+
+    Category:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        slug:
+          type: string
+        icon:
+          type: string
+        color:
+          type: string
+        productCount:
+          type: number
+      required:
+        - id
+        - name
+        - slug
+        - icon
+        - color
+        - productCount
+
+    Product:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        price:
+          type: number
+        originalPrice:
+          type: number
+        discount:
+          type: number
+        unit:
+          type: string
+        quantity:
+          type: string
+        categoryId:
+          type: string
+        categoryName:
+          type: string
+        imageUrl:
+          type: string
+        inStock:
+          type: boolean
+        rating:
+          type: number
+        reviewCount:
+          type: number
+        isFeatured:
+          type: boolean
+        isOrganic:
+          type: boolean
+        tags:
+          type: array
+          items:
+            type: string
+        deliveryTime:
+          type: string
+        variants:
+          type: array
+          items:
+            type: string
+        updatedAt:
+          type: string
+      required:
+        - id
+        - name
+        - description
+        - price
+        - originalPrice
+        - discount
+        - unit
+        - quantity
+        - categoryId
+        - categoryName
+        - imageUrl
+        - inStock
+        - rating
+        - reviewCount
+        - isFeatured
+        - isOrganic
+        - tags
+        - deliveryTime
+        - updatedAt
+
+    ProductSummary:
+      type: object
+      properties:
+        totalProducts:
+          type: number
+        totalCategories:
+          type: number
+        inStockCount:
+          type: number
+        avgDiscount:
+          type: number
+        featuredCount:
+          type: number
+      required:
+        - totalProducts
+        - totalCategories
+        - inStockCount
+        - avgDiscount
+        - featuredCount
+
+    CartItem:
+      type: object
+      properties:
+        productId:
+          type: string
+        product:
+          $ref: "#/components/schemas/Product"
+        quantity:
+          type: number
+      required:
+        - productId
+        - product
+        - quantity
+
+    Cart:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CartItem"
+        subtotal:
+          type: number
+        deliveryFee:
+          type: number
+        total:
+          type: number
+        itemCount:
+          type: number
+        savings:
+          type: number
+      required:
+        - items
+        - subtotal
+        - deliveryFee
+        - total
+        - itemCount
+        - savings
+
+    AddToCartRequest:
+      type: object
+      properties:
+        productId:
+          type: string
+        quantity:
+          type: number
+      required:
+        - productId
+        - quantity
+
+    UpdateCartItemRequest:
+      type: object
+      properties:
+        quantity:
+          type: number
+      required:
+        - quantity
+
+    PlaceOrderRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        phone:
+          type: string
+        address:
+          type: string
+        city:
+          type: string
+        landmark:
+          type: string
+        pincode:
+          type: string
+        paymentMethod:
+          type: string
+        deliveryInstructions:
+          type: string
+        upiId:
+          type: string
+        couponCode:
+          type: string
+        deliverySlot:
+          type: string
+      required:
+        - name
+        - phone
+        - address
+        - paymentMethod
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CartItem"
+        total:
+          type: number
+        status:
+          type: string
+        estimatedDelivery:
+          type: string
+        deliverySlot:
+          type: string
+          nullable: true
+        createdAt:
+          type: string
+      required:
+        - id
+        - items
+        - total
+        - status
+        - estimatedDelivery
+        - createdAt
